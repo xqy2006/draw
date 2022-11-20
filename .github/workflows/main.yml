@@ -19,7 +19,7 @@ jobs:
         run: |
           yarn install
           yarn build
-          cp -r ./build/* ./electron
+          copy ./build/* ./electron/
           cd electron
           dir
           npm install
