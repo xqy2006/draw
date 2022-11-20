@@ -20,10 +20,20 @@ jobs:
         run: |
           yarn install
           yarn build
+          cp -r build/* /electron
+          cd electron
+          dir
+          npm install
+          npm run make
+          cd ..
       - uses: actions/upload-artifact@v2
         with:
           name: build
           path: build/
+      - uses: actions/upload-artifact@v2
+        with:
+          name: electron
+          path: electron/out/
       - uses: JamesIves/github-pages-deploy-action@v4.3.3
         with:
           branch: gh-pages
