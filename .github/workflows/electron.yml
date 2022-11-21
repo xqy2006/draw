@@ -1,0 +1,30 @@
+name: electron
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  electron:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 2
+      - name: Setup Node.js 14.x
+        uses: actions/setup-node@v2
+        with:
+          node-version: 14.x
+      - name: Auto release
+        run: |
+          yarn install
+          yarn build
+          copy ./build/* ./electron/ -r
+          cd electron
+          npm install
+          npm run make
+          cd ..
+      - uses: actions/upload-artifact@v2
+        with:
+          name: electron
+          path: ./electron/out/
