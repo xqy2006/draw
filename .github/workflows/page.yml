@@ -1,4 +1,4 @@
-name: Auto release
+name: Page release
 on:
   push:
     branches:
@@ -6,7 +6,7 @@ on:
 
 jobs:
   Auto-release:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
         with:
