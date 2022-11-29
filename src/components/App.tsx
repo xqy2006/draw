@@ -133,7 +133,6 @@ import {
   isInitializedImageElement,
   isLinearElement,
   isLinearElementType,
-  isTextBindableContainer,
 } from "../element/typeChecks";
 import {
   ExcalidrawBindableElement,
@@ -175,7 +174,6 @@ import { renderScene } from "../renderer/renderScene";
 import { invalidateShapeForElement } from "../renderer/renderElement";
 import {
   calculateScrollCenter,
-  getTextBindableContainerAtPosition,
   getElementsAtPosition,
   getElementsWithinSelection,
   getNormalizedZoom,
@@ -224,6 +222,7 @@ import {
   updateObject,
   setEraserCursor,
   updateActiveTool,
+  getShortcutKey,
 } from "../utils";
 import ContextMenu, { ContextMenuOption } from "./ContextMenu";
 import LayerUI from "./LayerUI";
@@ -251,10 +250,12 @@ import throttle from "lodash.throttle";
 import { fileOpen, FileSystemHandle } from "../data/filesystem";
 import {
   bindTextToShapeAfterDuplication,
+  getApproxLineHeight,
   getApproxMinLineHeight,
   getApproxMinLineWidth,
   getBoundTextElement,
   getContainerDims,
+  getTextBindableContainerAtPosition,
   isValidTextContainer,
 } from "../element/textElement";
 import { isHittingElementNotConsideringBoundingBox } from "../element/collision";
@@ -326,6 +327,10 @@ let invalidateContextMenu = false;
 // remove this hack when we can sync render & resizeObserver (state update)
 // to rAF. See #5439
 let THROTTLE_NEXT_RENDER = true;
+
+let IS_PLAIN_PASTE = false;
+let IS_PLAIN_PASTE_TIMER = 0;
+let PLAIN_PASTE_TOAST_SHOWN = false;
 
 let lastPointerUp: ((event: any) => void) | null = null;
 const gesture: Gesture = {
@@ -1453,6 +1458,8 @@ class App extends React.Component<AppProps, AppState> {
 
   private pasteFromClipboard = withBatchedUpdates(
     async (event: ClipboardEvent | null) => {
+      const isPlainPaste = !!(IS_PLAIN_PASTE && event);
+
       // #686
       const target = document.activeElement;
       const isExcalidrawActive =
@@ -1463,8 +1470,6 @@ class App extends React.Component<AppProps, AppState> {
 
       const elementUnderCursor = document.elementFromPoint(cursorX, cursorY);
       if (
-        // if no ClipboardEvent supplied, assume we're pasting via contextMenu
-        // thus these checks don't make sense
         event &&
         (!(elementUnderCursor instanceof HTMLCanvasElement) ||
           isWritableElement(target))
@@ -1477,9 +1482,9 @@ class App extends React.Component<AppProps, AppState> {
       // (something something security)
       let file = event?.clipboardData?.files[0];
 
-      const data = await parseClipboard(event);
+      const data = await parseClipboard(event, isPlainPaste);
 
-      if (!file && data.text) {
+      if (!file && data.text && !isPlainPaste) {
         const string = data.text.trim();
         if (string.startsWith("<svg") && string.endsWith("</svg>")) {
           // ignore SVG validation/normalization which will be done during image
@@ -1512,9 +1517,10 @@ class App extends React.Component<AppProps, AppState> {
           console.error(error);
         }
       }
+
       if (data.errorMessage) {
         this.setState({ errorMessage: data.errorMessage });
-      } else if (data.spreadsheet) {
+      } else if (data.spreadsheet && !isPlainPaste) {
         this.setState({
           pasteDialog: {
             data: data.spreadsheet,
@@ -1522,13 +1528,14 @@ class App extends React.Component<AppProps, AppState> {
           },
         });
       } else if (data.elements) {
+        // TODO remove formatting from elements if isPlainPaste
         this.addElementsFromPasteOrLibrary({
           elements: data.elements,
           files: data.files || null,
           position: "cursor",
         });
       } else if (data.text) {
-        this.addTextFromPaste(data.text);
+        this.addTextFromPaste(data.text, isPlainPaste);
       }
       this.setActiveTool({ type: "selection" });
       event?.preventDefault();
@@ -1635,13 +1642,13 @@ class App extends React.Component<AppProps, AppState> {
     this.setActiveTool({ type: "selection" });
   };
 
-  private addTextFromPaste(text: any) {
+  private addTextFromPaste(text: string, isPlainPaste = false) {
     const { x, y } = viewportCoordsToSceneCoords(
       { clientX: cursorX, clientY: cursorY },
       this.state,
     );
 
-    const element = newTextElement({
+    const textElementProps = {
       x,
       y,
       strokeColor: this.state.currentItemStrokeColor,
@@ -1658,13 +1665,76 @@ class App extends React.Component<AppProps, AppState> {
       textAlign: this.state.currentItemTextAlign,
       verticalAlign: DEFAULT_VERTICAL_ALIGN,
       locked: false,
-    });
+    };
+
+    const LINE_GAP = 10;
+    let currentY = y;
+
+    const lines = isPlainPaste ? [text] : text.split("\n");
+    const textElements = lines.reduce(
+      (acc: ExcalidrawTextElement[], line, idx) => {
+        const text = line.trim();
+
+        if (text.length) {
+          const element = newTextElement({
+            ...textElementProps,
+            x,
+            y: currentY,
+            text,
+          });
+          acc.push(element);
+          currentY += element.height + LINE_GAP;
+        } else {
+          const prevLine = lines[idx - 1]?.trim();
+          // add paragraph only if previous line was not empty, IOW don't add
+          // more than one empty line
+          if (prevLine) {
+            const defaultLineHeight = getApproxLineHeight(
+              getFontString({
+                fontSize: textElementProps.fontSize,
+                fontFamily: textElementProps.fontFamily,
+              }),
+            );
+
+            currentY += defaultLineHeight + LINE_GAP;
+          }
+        }
+
+        return acc;
+      },
+      [],
+    );
+
+    if (textElements.length === 0) {
+      return;
+    }
 
     this.scene.replaceAllElements([
       ...this.scene.getElementsIncludingDeleted(),
-      element,
+      ...textElements,
     ]);
-    this.setState({ selectedElementIds: { [element.id]: true } });
+
+    this.setState({
+      selectedElementIds: Object.fromEntries(
+        textElements.map((el) => [el.id, true]),
+      ),
+    });
+
+    if (
+      !isPlainPaste &&
+      textElements.length > 1 &&
+      PLAIN_PASTE_TOAST_SHOWN === false &&
+      !this.device.isMobile
+    ) {
+      this.setToast({
+        message: t("toast.pasteAsSingleElement", {
+          shortcut: getShortcutKey("CtrlOrCmd+Shift+V"),
+        }),
+        duration: 5000,
+      });
+      PLAIN_PASTE_TOAST_SHOWN = true;
+    }
+
     this.history.resumeRecording();
   }
 
@@ -1874,6 +1944,17 @@ class App extends React.Component<AppProps, AppState> {
         });
       }
 
+      if (event[KEYS.CTRL_OR_CMD] && event.key.toLowerCase() === KEYS.V) {
+        IS_PLAIN_PASTE = event.shiftKey;
+        clearTimeout(IS_PLAIN_PASTE_TIMER);
+        // reset (100ms to be safe that we it runs after the ensuing
+        // paste event). Though, technically unnecessary to reset since we
+        // (re)set the flag before each paste event.
+        IS_PLAIN_PASTE_TIMER = window.setTimeout(() => {
+          IS_PLAIN_PASTE = false;
+        }, 100);
+      }
+
       // prevent browser zoom in input fields
       if (event[KEYS.CTRL_OR_CMD] && isWritableElement(event.target)) {
         if (event.code === CODES.MINUS || event.code === CODES.EQUAL) {
@@ -1990,10 +2071,14 @@ class App extends React.Component<AppProps, AppState> {
             isTextElement(selectedElement) ||
             isValidTextContainer(selectedElement)
           ) {
+            let container;
+            if (!isTextElement(selectedElement)) {
+              container = selectedElement as ExcalidrawTextContainer;
+            }
             this.startTextEditing({
               sceneX: selectedElement.x + selectedElement.width / 2,
               sceneY: selectedElement.y + selectedElement.height / 2,
-              shouldBind: true,
+              container,
             });
             event.preventDefault();
             return;
@@ -2317,7 +2402,6 @@ class App extends React.Component<AppProps, AppState> {
     const element = this.getElementAtPosition(x, y, {
       includeBoundTextElement: true,
     });
-
     if (element && isTextElement(element) && !element.isDeleted) {
       return element;
     }
@@ -2394,29 +2478,31 @@ class App extends React.Component<AppProps, AppState> {
   private startTextEditing = ({
     sceneX,
     sceneY,
-    shouldBind,
     insertAtParentCenter = true,
+    container,
   }: {
     /** X position to insert text at */
     sceneX: number;
     /** Y position to insert text at */
     sceneY: number;
-    shouldBind: boolean;
     /** whether to attempt to insert at element center if applicable */
     insertAtParentCenter?: boolean;
+    container?: ExcalidrawTextContainer | null;
   }) => {
+    let shouldBindToContainer = false;
+
     let parentCenterPosition =
       insertAtParentCenter &&
       this.getTextWysiwygSnappedToCenterPosition(
         sceneX,
         sceneY,
         this.state,
-        this.canvas,
-        window.devicePixelRatio,
+        container,
       );
-
+    if (container && parentCenterPosition) {
+      shouldBindToContainer = true;
+    }
     let existingTextElement: NonDeleted<ExcalidrawTextElement> | null = null;
-    let container: ExcalidrawTextContainer | null = null;
 
     const selectedElements = getSelectedElements(
       this.scene.getNonDeletedElements(),
@@ -2426,7 +2512,7 @@ class App extends React.Component<AppProps, AppState> {
     if (selectedElements.length === 1) {
       if (isTextElement(selectedElements[0])) {
         existingTextElement = selectedElements[0];
-      } else if (isTextBindableContainer(selectedElements[0], false)) {
+      } else if (container) {
         existingTextElement = getBoundTextElement(selectedElements[0]);
       } else {
         existingTextElement = this.getTextElementAtPosition(sceneX, sceneY);
@@ -2435,26 +2521,7 @@ class App extends React.Component<AppProps, AppState> {
       existingTextElement = this.getTextElementAtPosition(sceneX, sceneY);
     }
 
-    // bind to container when shouldBind is true or
-    // clicked on center of container
-    if (
-      !container &&
-      !existingTextElement &&
-      (shouldBind || parentCenterPosition)
-    ) {
-      container = getTextBindableContainerAtPosition(
-        this.scene
-          .getNonDeletedElements()
-          .filter(
-            (ele) =>
-              isTextBindableContainer(ele, false) && !getBoundTextElement(ele),
-          ),
-        sceneX,
-        sceneY,
-      );
-    }
-
-    if (!existingTextElement && container) {
+    if (!existingTextElement && shouldBindToContainer && container) {
       const fontString = {
         fontSize: this.state.currentItemFontSize,
         fontFamily: this.state.currentItemFontFamily,
@@ -2472,12 +2539,10 @@ class App extends React.Component<AppProps, AppState> {
           sceneX,
           sceneY,
           this.state,
-          this.canvas,
-          window.devicePixelRatio,
+          container,
         );
       }
     }
-
     const element = existingTextElement
       ? existingTextElement
       : newTextElement({
@@ -2504,7 +2569,7 @@ class App extends React.Component<AppProps, AppState> {
           verticalAlign: parentCenterPosition
             ? VERTICAL_ALIGN.MIDDLE
             : DEFAULT_VERTICAL_ALIGN,
-          containerId: container?.id ?? undefined,
+          containerId: shouldBindToContainer ? container?.id : undefined,
           groupIds: container?.groupIds ?? [],
           locked: false,
         });
@@ -2512,10 +2577,15 @@ class App extends React.Component<AppProps, AppState> {
     this.setState({ editingElement: element });
 
     if (!existingTextElement) {
-      this.scene.replaceAllElements([
-        ...this.scene.getElementsIncludingDeleted(),
-        element,
-      ]);
+      if (container && shouldBindToContainer) {
+        const containerIndex = this.scene.getElementIndex(container.id);
+        this.scene.insertElementAtIndex(element, containerIndex + 1);
+      } else {
+        this.scene.replaceAllElements([
+          ...this.scene.getElementsIncludingDeleted(),
+          element,
+        ]);
+      }
 
       // case: creating new text not centered to parent element → offset Y
       // so that the text is centered to cursor position
@@ -2603,22 +2673,23 @@ class App extends React.Component<AppProps, AppState> {
 
     resetCursor(this.canvas);
     if (!event[KEYS.CTRL_OR_CMD] && !this.state.viewModeEnabled) {
-      const selectedElements = getSelectedElements(
+      const container = getTextBindableContainerAtPosition(
         this.scene.getNonDeletedElements(),
         this.state,
+        sceneX,
+        sceneY,
       );
-      if (selectedElements.length === 1) {
-        const selectedElement = selectedElements[0];
-        if (hasBoundTextElement(selectedElement)) {
-          sceneX = selectedElement.x + selectedElement.width / 2;
-          sceneY = selectedElement.y + selectedElement.height / 2;
+      if (container) {
+        if (hasBoundTextElement(container)) {
+          sceneX = container.x + container.width / 2;
+          sceneY = container.y + container.height / 2;
         }
       }
       this.startTextEditing({
         sceneX,
         sceneY,
-        shouldBind: false,
         insertAtParentCenter: !event.altKey,
+        container,
       });
     }
   };
@@ -2814,7 +2885,10 @@ class App extends React.Component<AppProps, AppState> {
       if (editingLinearElement?.lastUncommittedPoint != null) {
         this.maybeSuggestBindingAtCursor(scenePointer);
       } else {
-        this.setState({ suggestedBindings: [] });
+        // causes stack overflow if not sync
+        flushSync(() => {
+          this.setState({ suggestedBindings: [] });
+        });
       }
     }
 
@@ -3754,7 +3828,7 @@ class App extends React.Component<AppProps, AppState> {
               this.setState({ editingLinearElement: ret.linearElementEditor });
             }
           }
-          if (ret.didAddPoint && !ret.isMidPoint) {
+          if (ret.didAddPoint) {
             return true;
           }
         }
@@ -3911,15 +3985,23 @@ class App extends React.Component<AppProps, AppState> {
       includeBoundTextElement: true,
     });
 
+    let container = getTextBindableContainerAtPosition(
+      this.scene.getNonDeletedElements(),
+      this.state,
+      sceneX,
+      sceneY,
+    );
+
     if (hasBoundTextElement(element)) {
+      container = element as ExcalidrawTextContainer;
       sceneX = element.x + element.width / 2;
       sceneY = element.y + element.height / 2;
     }
     this.startTextEditing({
       sceneX,
       sceneY,
-      shouldBind: false,
       insertAtParentCenter: !event.altKey,
+      container,
     });
 
     resetCursor(this.canvas);
@@ -4236,7 +4318,6 @@ class App extends React.Component<AppProps, AppState> {
       // to ensure we don't create a 2-point arrow by mistake when
       // user clicks mouse in a way that it moves a tiny bit (thus
       // triggering pointermove)
-
       if (
         !pointerDownState.drag.hasOccurred &&
         (this.state.activeTool.type === "arrow" ||
@@ -4264,6 +4345,56 @@ class App extends React.Component<AppProps, AppState> {
       if (this.state.selectedLinearElement) {
         const linearElementEditor =
           this.state.editingLinearElement || this.state.selectedLinearElement;
+
+        if (
+          LinearElementEditor.shouldAddMidpoint(
+            this.state.selectedLinearElement,
+            pointerCoords,
+            this.state,
+          )
+        ) {
+          const ret = LinearElementEditor.addMidpoint(
+            this.state.selectedLinearElement,
+            pointerCoords,
+            this.state,
+          );
+          if (!ret) {
+            return;
+          }
+
+          // Since we are reading from previous state which is not possible with
+          // automatic batching in React 18 hence using flush sync to synchronously
+          // update the state. Check https://github.com/excalidraw/excalidraw/pull/5508 for more details.
+
+          flushSync(() => {
+            if (this.state.selectedLinearElement) {
+              this.setState({
+                selectedLinearElement: {
+                  ...this.state.selectedLinearElement,
+                  pointerDownState: ret.pointerDownState,
+                  selectedPointsIndices: ret.selectedPointsIndices,
+                },
+              });
+            }
+            if (this.state.editingLinearElement) {
+              this.setState({
+                editingLinearElement: {
+                  ...this.state.editingLinearElement,
+                  pointerDownState: ret.pointerDownState,
+                  selectedPointsIndices: ret.selectedPointsIndices,
+                },
+              });
+            }
+          });
+
+          return;
+        } else if (
+          linearElementEditor.pointerDownState.segmentMidpoint.value !== null &&
+          !linearElementEditor.pointerDownState.segmentMidpoint.added
+        ) {
+          return;
+        }
+
         const didDrag = LinearElementEditor.handlePointDragging(
           event,
           this.state,
@@ -6171,21 +6302,11 @@ class App extends React.Component<AppProps, AppState> {
     x: number,
     y: number,
     appState: AppState,
-    canvas: HTMLCanvasElement | null,
-    scale: number,
+    container?: ExcalidrawTextContainer | null,
   ) {
-    const elementClickedInside = getTextBindableContainerAtPosition(
-      this.scene
-        .getElementsIncludingDeleted()
-        .filter((element) => !isTextElement(element)),
-      x,
-      y,
-    );
-    if (elementClickedInside) {
-      const elementCenterX =
-        elementClickedInside.x + elementClickedInside.width / 2;
-      const elementCenterY =
-        elementClickedInside.y + elementClickedInside.height / 2;
+    if (container) {
+      const elementCenterX = container.x + container.width / 2;
+      const elementCenterY = container.y + container.height / 2;
       const distanceToCenter = Math.hypot(
         x - elementCenterX,
         y - elementCenterY,
